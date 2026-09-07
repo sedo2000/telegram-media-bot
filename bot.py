@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -14,36 +15,35 @@ from PIL import Image
 from moviepy.editor import VideoFileClip
 from pydub import AudioSegment
 
-# إعداد السجلات (Logging)
+# إعداد السجلات
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- جلب المتغيرات من بيئة Vercel ---
-# هذه المتغيرات ستقوم بإضافتها في إعدادات مشروع Vercel
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+# ----------------------------------------------------
+# 1. التعديل الأهم: تسمية المتغير بـ app ليتعرف عليه Vercel
+# ----------------------------------------------------
+app = Flask(__name__)
 
-app_flask = Flask(__name__)
-telegram_app = None
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
+# تهيئة تطبيق التليجرام عالمياً
+if TOKEN:
+    telegram_app = Application.builder().token(TOKEN).build()
+else:
+    telegram_app = None
 
-@app_flask.route("/", methods=["GET"])
-def index():
-    return "Telegram Bot is running smoothly on Vercel!", 200
-
-
-@app_flask.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    if request.method == "POST":
-        json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, telegram_app.bot)
-        telegram_app.update_queue.put(update)
-    return "OK", 200
+# دالة مساعدة لتشغيل الأكواد غير المتزامنة (async) داخل Flask (sync)
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
-# دالة البدء /start
+# ----------------------------------------------------
+# 2. دوال البوت (Handlers)
+# ----------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "مرحباً بك في بوت التحويل الشامل!\n\n"
@@ -58,12 +58,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text)
 
 
-# معالجة الوسائط
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat_id = message.chat.id
     
-    # استخدام /tmp وهو المسار المسموح للكتابة فيه على Vercel Serverless
+    # استخدام /tmp وهو المسار المسموح للكتابة فيه على Vercel
     temp_dir = "/tmp" 
 
     try:
@@ -164,16 +163,15 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             square_clip.write_videofile(vnote_path, codec="libx264", audio_codec="aac", preset="ultrafast")
 
             await message.reply_audio(audio=open(audio_mp3, "rb"), caption="الصوت المستخرج")
-            await message.reply_animation(animation=open(gif_path, "rb"), caption="صورة متحركة (5 ثوانٍ)")
+            await message.reply_animation(animation=open(gif_path, "rb"), caption="صورة متحركة")
             await message.reply_video_note(video_note=open(vnote_path, "rb"))
             return
 
     except Exception as e:
          logger.error(f"Error processing media: {e}")
-         await message.reply_text("حدث خطأ أثناء المعالجة. يرجى المحاولة لاحقاً.")
+         await message.reply_text("حدث خطأ أثناء المعالجة، قد يكون الملف كبيراً جداً على خوادم Vercel المحدودة.")
 
 
-# تفاعل الأزرار
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -186,16 +184,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "edit_thumb":
         await query.message.reply_text("أرسل الصورة المصغرة الجديدة:")
 
-# إعداد التطبيق للعمل مع Webhook
-def main():
-    global telegram_app
-    
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN environment variable is not set!")
-        return
-
-    telegram_app = Application.builder().token(TOKEN).build()
-
+# إضافة الـ Handlers للتطبيق
+if telegram_app:
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(
         MessageHandler(
@@ -205,18 +195,29 @@ def main():
     )
     telegram_app.add_handler(CallbackQueryHandler(button_callback))
 
-    if WEBHOOK_URL:
-        # إعداد Webhook
-        full_webhook_url = f"{WEBHOOK_URL}/{TOKEN}"
-        telegram_app.bot.set_webhook(url=full_webhook_url)
-        logger.info(f"Webhook set to: {full_webhook_url}")
-        
-        # تشغيل سيرفر Flask
-        port = int(os.environ.get("PORT", 5000))
-        app_flask.run(host="0.0.0.0", port=port)
-    else:
-        logger.warning("WEBHOOK_URL is not set. Running in polling mode (Not recommended for Vercel).")
-        telegram_app.run_polling()
 
-if __name__ == "__main__":
-    main()
+# ----------------------------------------------------
+# 3. توجيهات مسارات Vercel (Routes)
+# ----------------------------------------------------
+
+async def process_update_async(update_data):
+    # وظيفة مخصصة لتهيئة البوت وتشغيل التحديث
+    if not telegram_app._initialized:
+        await telegram_app.initialize()
+    update = Update.de_json(update_data, telegram_app.bot)
+    await telegram_app.process_update(update)
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Telegram Bot is running smoothly on Vercel!", 200
+
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    if request.method == "POST":
+        update_data = request.get_json(force=True)
+        # استدعاء المعالجة بشكل يتناسب مع طبيعة Serverless
+        run_async(process_update_async(update_data))
+    return "OK", 200
+
+# ملاحظة: قمنا بإزالة دالة `if __name__ == "__main__": app.run()` تماماً 
+# لأن Vercel يعتمد على المتغير `app` بشكل مباشر كـ Entry Point.
